@@ -29,9 +29,11 @@ def setup_utility_commands(bot: commands.Bot):
 `/remove_message <index>` - Remove a message by index
 `/rotation_status` - Show rotation status
 
-**LeetCode:**
+**LeetCode & NeetCode:**
 
 `/force_leetcode` - Manually trigger the daily LeetCode post (Admin only)
+`/force_neetcode` - Manually trigger the next NeetCode 150 problem (Admin only)
+`/neetcode_progress` - Show NeetCode 150 progress
 
 **Utility:**
 
@@ -40,14 +42,13 @@ def setup_utility_commands(bot: commands.Bot):
 
 **Auto-Features:**
 - Mention or reply to the bot to chat with AI
-- Daily LeetCode question posted automatically
+- Daily LeetCode question + NeetCode 150 problem posted automatically
 """
     await ctx.send(help_text)
 
   @bot.command()
   async def force_leetcode(ctx):
     """Manually triggers the LeetCode daily post (Admin only)."""
-    # Simple check for admin permissions or specific user
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ You need administrator permissions to use this command.")
         return
@@ -65,6 +66,52 @@ def setup_utility_commands(bot: commands.Bot):
     embed = leetcode_service.create_daily_embed(question)
     message = await ctx.send(embed=embed)
     
-    # Create thread
     question_title = question.get("question", {}).get("title", "Daily Question")
     await message.create_thread(name=f"🧵 {question_title}", auto_archive_duration=1440)
+
+  @bot.command()
+  async def force_neetcode(ctx):
+    """Manually triggers the next NeetCode 150 problem (Admin only)."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You need administrator permissions to use this command.")
+        return
+
+    await ctx.send("⏳ Getting next NeetCode 150 problem...")
+    
+    from services.neetcode_service import get_neetcode_service
+    neetcode_service = get_neetcode_service()
+    
+    problem, current, total = neetcode_service.get_next_problem()
+    if not problem:
+        await ctx.send("❌ Failed to get NeetCode problem. Check logs.")
+        return
+        
+    embed = neetcode_service.create_neetcode_embed(problem, current, total)
+    message = await ctx.send(embed=embed)
+    
+    await message.create_thread(name=f"🧵 NC150: {problem['title']}", auto_archive_duration=1440)
+
+  @bot.command()
+  async def neetcode_progress(ctx):
+    """Show the current NeetCode 150 progress."""
+    from services.neetcode_service import get_neetcode_service
+    neetcode_service = get_neetcode_service()
+    
+    current, total = neetcode_service.get_progress()
+    
+    # Get the next problem info without advancing
+    if neetcode_service.problems:
+        index = current - 1
+        if index >= total:
+            index = 0
+        next_problem = neetcode_service.problems[index]
+        category = next_problem.get("category", "Unknown")
+        title = next_problem.get("title", "Unknown")
+        difficulty = next_problem.get("difficulty", "Unknown")
+        
+        await ctx.send(
+            f"📋 **NeetCode 150 Progress:** {current}/{total}\n"
+            f"**Next up:** {title} ({difficulty}) — {category}"
+        )
+    else:
+        await ctx.send("❌ NeetCode 150 data not loaded.")
