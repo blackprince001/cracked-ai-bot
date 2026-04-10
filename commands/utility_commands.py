@@ -109,7 +109,7 @@ def setup_utility_commands(bot: commands.Bot):
       await ctx.send("❌ Scheduled tasks not initialized. Try again after the bot is fully ready.")
       return
 
-    await _scheduled_tasks_instance.post_weekly_rankings(target_channel_id=ctx.channel.id)
+    await _scheduled_tasks_instance.post_weekly_rankings(target_channel_id=ctx.channel.id, dry_run=True)
 
   @bot.command()
   async def neetcode_progress(ctx):
