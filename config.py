@@ -21,7 +21,7 @@ ED_CHANNEL_NAME = "ed"
 MD_CHANNEL_NAME = "md"
 
 # Activity Ranking Configuration
-ACTIVITY_CHANNEL_NAME = "general"
+ACTIVITY_CHANNEL_NAME = "chat"
 # 5:00 AM UTC every Monday
 WEEKLY_RANKING_HOUR = 5
 WEEKLY_RANKING_MINUTE = 0
