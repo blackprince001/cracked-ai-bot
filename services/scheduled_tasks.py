@@ -149,7 +149,7 @@ class ScheduledTasks:
     async def before_weekly_ranking_task(self):
         await self.bot.wait_until_ready()
 
-    async def post_weekly_rankings(self, target_channel_id: int = None):
+    async def post_weekly_rankings(self, target_channel_id: int = None, dry_run: bool = False):
         """Build and post the weekly activity leaderboard, then kick the least active member."""
         now = datetime.datetime.now(datetime.timezone.utc)
         week_start = (now - datetime.timedelta(days=7)).strftime("%b %d")
@@ -238,21 +238,28 @@ class ScheduledTasks:
                         continue
 
                     label = "message" if victim_msgs == 1 else "messages"
-                    await channel.send(
-                        f"⚠️ {victim.mention} you sent only **{victim_msgs} {label}** this week. "
-                        f"You are being **purged from the server in 1 hour**. "
-                        f"This is your only warning. 🕐"
-                    )
-                    logger.info(f"⏳ Purge warning sent to {victim} in {guild.name}. Kick in 1 hour.")
-                    await asyncio.sleep(3600)
-                    try:
-                        await guild.kick(victim, reason="Weekly inactivity purge")
-                        await channel.send(f"🦵 {victim.display_name} has been purged. See you never.")
-                        logger.info(f"🦵 Kicked {victim} from {guild.name} for inactivity ({victim_msgs} msgs)")
-                    except discord.Forbidden:
-                        logger.warning(f"❌ Missing kick permission in {guild.name}")
-                    except Exception as e:
-                        logger.error(f"❌ Error kicking {victim} from {guild.name}: {e}")
+                    if dry_run:
+                        await channel.send(
+                            f"👀 {victim.mention} you only sent **{victim_msgs} {label}** this week. "
+                            f"You need to up your game — next time this is for real. 😤"
+                        )
+                        logger.info(f"[dry run] Would have kicked {victim} from {guild.name} ({victim_msgs} msgs)")
+                    else:
+                        await channel.send(
+                            f"⚠️ {victim.mention} you sent only **{victim_msgs} {label}** this week. "
+                            f"You are being **purged from the server in 1 hour**. "
+                            f"This is your only warning. 🕐"
+                        )
+                        logger.info(f"⏳ Purge warning sent to {victim} in {guild.name}. Kick in 1 hour.")
+                        await asyncio.sleep(3600)
+                        try:
+                            await guild.kick(victim, reason="Weekly inactivity purge")
+                            await channel.send(f"🦵 {victim.display_name} has been purged. See you never.")
+                            logger.info(f"🦵 Kicked {victim} from {guild.name} for inactivity ({victim_msgs} msgs)")
+                        except discord.Forbidden:
+                            logger.warning(f"❌ Missing kick permission in {guild.name}")
+                        except Exception as e:
+                            logger.error(f"❌ Error kicking {victim} from {guild.name}: {e}")
                 else:
                     logger.info(f"No eligible kick candidates in {guild.name}")
 
