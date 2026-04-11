@@ -140,7 +140,11 @@ class ScheduledTasks:
     @tasks.loop(time=[datetime.time(hour=WEEKLY_RANKING_HOUR, minute=WEEKLY_RANKING_MINUTE, tzinfo=datetime.timezone.utc)])
     async def weekly_ranking_task(self):
         """Runs daily but only executes the ranking logic on Mondays."""
-        if datetime.datetime.now(datetime.timezone.utc).weekday() != 0:  # 0 = Monday
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now.weekday() != 0:  # 0 = Monday
+            return
+        if now.date() == datetime.date(2026, 4, 13):
+            logger.info("⏭️ Skipping weekly ranking for Apr 13 (excluded date)")
             return
         logger.info("📊 Running weekly activity ranking")
         await self.post_weekly_rankings()

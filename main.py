@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 from commands import ai_commands, message_commands, utility_commands
-from config import GEMINI_API_KEY, TOKEN
+from config import GEMINI_API_KEY, TOKEN, WORDLE_CHANNEL_NAME
 from db import message_db
 from utils.logging import get_logger, setup_logging
 
@@ -31,6 +31,26 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+  # Credit Wordle players — slash command interactions don't fire on_message for the user,
+  # but the Wordle bot's response message contains the original interaction + user.
+  if (
+    message.author.bot
+    and message.guild
+    and message.interaction
+    and hasattr(message.channel, "name")
+    and message.channel.name == WORDLE_CHANNEL_NAME
+  ):
+    content_hash = hashlib.sha256(str(message.interaction.id).encode()).hexdigest()
+    await message_db.insert_message(
+      message_id=str(message.interaction.id),
+      channel_id=str(message.channel.id),
+      guild_id=str(message.guild.id),
+      author_id=str(message.interaction.user.id),
+      content="[wordle]",
+      content_hash=content_hash,
+      message_url=message.jump_url,
+    )
+
   # Ignore bot messages
   if message.author.bot:
     return
