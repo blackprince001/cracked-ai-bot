@@ -40,6 +40,7 @@ async def on_ready():
 
   # Initialize scheduled tasks
   from services.scheduled_tasks import setup_scheduled_tasks
+
   scheduled_tasks = setup_scheduled_tasks(bot)
   await scheduled_tasks.hydrate_missing_weekly_activity()
 
@@ -69,7 +70,9 @@ async def on_member_join(member: discord.Member):
     await channel.send(content=member.mention, embed=embed)
     logger.info(f"👋 Welcomed {member} to {member.guild.name}")
   except discord.Forbidden:
-    logger.warning(f"❌ Missing send permission in #{WELCOME_CHANNEL_NAME} ({member.guild.name})")
+    logger.warning(
+      f"❌ Missing send permission in #{WELCOME_CHANNEL_NAME} ({member.guild.name})"
+    )
 
 
 @bot.event
@@ -78,29 +81,34 @@ async def on_member_remove(member: discord.Member):
   if not channel:
     return
   try:
-    await channel.send(f"👋 **{member.display_name}** has left the server. See you on the leaderboard.")
+    await channel.send(
+      f"👋 **{member.display_name}** has left the server. See you on the leaderboard."
+    )
     logger.info(f"👋 {member} left {member.guild.name}")
   except discord.Forbidden:
-    logger.warning(f"❌ Missing send permission in #{WELCOME_CHANNEL_NAME} ({member.guild.name})")
+    logger.warning(
+      f"❌ Missing send permission in #{WELCOME_CHANNEL_NAME} ({member.guild.name})"
+    )
 
 
 @bot.event
 async def on_message(message: discord.Message):
   # Credit Wordle players — slash command interactions don't fire on_message for the user,
-  # but the Wordle bot's response message contains the original interaction + user.
+  # but the Wordle bot's response message contains interaction metadata for the user.
   if (
     message.author.bot
     and message.guild
-    and message.interaction
+    and message.interaction_metadata
     and hasattr(message.channel, "name")
     and message.channel.name == WORDLE_CHANNEL_NAME
   ):
-    content_hash = hashlib.sha256(str(message.interaction.id).encode()).hexdigest()
+    interaction = message.interaction_metadata
+    content_hash = hashlib.sha256(str(interaction.id).encode()).hexdigest()
     await message_db.insert_message(
-      message_id=str(message.interaction.id),
+      message_id=str(interaction.id),
       channel_id=str(message.channel.id),
       guild_id=str(message.guild.id),
-      author_id=str(message.interaction.user.id),
+      author_id=str(interaction.user.id),
       content="[wordle]",
       content_hash=content_hash,
       message_url=message.jump_url,
@@ -128,7 +136,7 @@ async def on_message(message: discord.Message):
   # Check if this is a reply to the bot's message
   is_reply_to_bot = False
   reply_chain = []
-  
+
   if message.reference and message.reference.message_id:
     try:
       # Recursively fetch up to 5 previous messages in the chain to build context
@@ -136,32 +144,37 @@ async def on_message(message: discord.Message):
       for _ in range(5):
         if not curr_msg.reference or not curr_msg.reference.message_id:
           break
-        
+
         prev_msg = await message.channel.fetch_message(curr_msg.reference.message_id)
         reply_chain.append(prev_msg)
         curr_msg = prev_msg
-        
+
         # Check if the original message was replying to the bot
         if curr_msg.author == bot.user and curr_msg.id == message.reference.message_id:
-            is_reply_to_bot = True
+          is_reply_to_bot = True
 
-      reply_chain.reverse() # Oldest to newest
+      reply_chain.reverse()  # Oldest to newest
     except discord.NotFound:
       pass
 
   # Check if bot was mentioned OR if it's a reply to the bot
   should_respond = (
-    (bot.user and bot.user.mentioned_in(message) and not message.mention_everyone)
-    or is_reply_to_bot
-  )
+    bot.user and bot.user.mentioned_in(message) and not message.mention_everyone
+  ) or is_reply_to_bot
 
   if should_respond:
     content = message.content
     if bot.user:
-      content = content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+      content = (
+        content.replace(f"<@{bot.user.id}>", "")
+        .replace(f"<@!{bot.user.id}>", "")
+        .strip()
+      )
 
     if content:
-      logger.info(f"💬 {'Reply' if is_reply_to_bot else 'Mention'} from {message.author.display_name}: {content[:50]}...")
+      logger.info(
+        f"💬 {'Reply' if is_reply_to_bot else 'Mention'} from {message.author.display_name}: {content[:50]}..."
+      )
 
       ctx = await bot.get_context(message)
       if ctx.guild:
@@ -171,8 +184,8 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
           system_msg = (
-            "You are a chill, helpful bot in a Discord server. "
-            "Keep responses SHORT and conversational - like texting a friend. "
+            "You are professional, calm, and helpful bot in a Discord server."
+            "Keep responses SHORT and conversational - like texting a friend or co-worker. "
             "Don't lecture, don't give unsolicited advice, don't be preachy. "
             "Just answer what's asked. Use casual language."
           )
@@ -181,10 +194,14 @@ async def on_message(message: discord.Message):
 
           # Build thread history string
           if reply_chain:
-            thread_history = "\n".join([f"{m.author.display_name}: {m.content}" for m in reply_chain])
+            thread_history = "\n".join(
+              [f"{m.author.display_name}: {m.content}" for m in reply_chain]
+            )
             prompt = f"--- CONVERSATION HISTORY ---\n{thread_history}\n--- END HISTORY ---\n\nUser's new message: {content}"
 
-          response = await ai_service.call_gemini_ai(prompt, system_message=system_msg, use_search=True)
+          response = await ai_service.call_gemini_ai(
+            prompt, system_message=system_msg, use_search=True
+          )
 
         # Send response as a reply to maintain the thread
         if len(response) > 2000:

@@ -156,28 +156,31 @@ class ScheduledTasks:
         await self.bot.wait_until_ready()
 
     async def hydrate_missing_weekly_activity(self):
-        """Rebuild this week's activity from Discord only when the DB has no rows for a guild."""
+        """Reconcile this week's activity from Discord history into the DB."""
+        logger.info(f"🔄 Starting weekly activity hydrate across {len(self.bot.guilds)} guild(s)")
         for guild in self.bot.guilds:
+            logger.info(f"🔄 Hydrating {guild.name}…")
             try:
-                await guild.chunk(cache=True)
+                await asyncio.wait_for(guild.chunk(cache=True), timeout=15)
+            except asyncio.TimeoutError:
+                logger.warning(f"guild.chunk timed out for {guild.name}; proceeding with cached members")
             except Exception as e:
                 logger.warning(f"Could not refresh member cache for {guild.name}: {e}")
 
             try:
-                existing_counts = await get_weekly_message_counts(str(guild.id))
-                if existing_counts:
-                    logger.info(f"Skipping weekly restore for {guild.name}: DB already has current-week rows")
-                    continue
-
                 member_ids = {str(member.id) for member in guild.members if not member.bot}
                 if not member_ids:
-                    logger.info(f"Skipping weekly restore for {guild.name}: no non-bot members")
+                    logger.info(f"Skipping weekly sync for {guild.name}: no non-bot members")
                     continue
 
                 restored = await self._restore_guild_weekly_messages(guild, member_ids)
-                logger.info(f"Restored {restored} weekly activity rows for {guild.name}")
+                if restored:
+                    logger.info(f"✅ Synced {restored} weekly activity rows for {guild.name}")
+                else:
+                    logger.info(f"✅ Weekly activity already up to date for {guild.name}")
             except Exception as e:
-                logger.error(f"Failed weekly restore for {guild.name}: {e}")
+                logger.error(f"❌ Failed weekly sync for {guild.name}: {e}")
+        logger.info("🔄 Hydrate complete")
 
     async def _restore_guild_weekly_messages(self, guild: discord.Guild, member_ids: set[str]) -> int:
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
@@ -185,6 +188,7 @@ class ScheduledTasks:
         channels.extend(thread for thread in guild.threads if not thread.archived)
 
         inserted = 0
+        logger.info(f"  Scanning {len(channels)} channel(s)/thread(s) in {guild.name}")
         for channel in channels:
             if not channel.permissions_for(guild.me).read_message_history:
                 continue
@@ -203,7 +207,9 @@ class ScheduledTasks:
                 continue
 
             if pending_rows:
-                inserted += await bulk_insert_messages(pending_rows)
+                added = await bulk_insert_messages(pending_rows)
+                inserted += added
+                logger.info(f"  #{channel.name}: +{added} rows ({len(pending_rows)} seen)")
 
         return inserted
 
@@ -216,24 +222,25 @@ class ScheduledTasks:
         if not message.guild:
             return None
 
-        # Preserve Wordle credit, which is represented by the bot response carrying the user interaction.
+        # Preserve Wordle credit, which is represented by the bot response carrying interaction metadata.
         if (
             message.author.bot
-            and message.interaction
+            and message.interaction_metadata
             and hasattr(message.channel, "name")
             and message.channel.name == WORDLE_CHANNEL_NAME
         ):
-            author_id = str(message.interaction.user.id)
+            interaction = message.interaction_metadata
+            author_id = str(interaction.user.id)
             if author_id not in member_ids:
                 return None
 
             return {
-                "message_id": str(message.interaction.id),
+                "message_id": str(interaction.id),
                 "channel_id": str(message.channel.id),
                 "guild_id": str(guild_id),
                 "author_id": author_id,
                 "content": "[wordle]",
-                "content_hash": hashlib.sha256(str(message.interaction.id).encode()).hexdigest(),
+                "content_hash": hashlib.sha256(str(interaction.id).encode()).hexdigest(),
                 "message_url": message.jump_url,
                 "created_at": message.created_at,
             }
@@ -256,132 +263,148 @@ class ScheduledTasks:
             "created_at": message.created_at,
         }
 
-    async def post_weekly_rankings(self, target_channel_id: int = None, dry_run: bool = False):
-        """Build and post the weekly activity leaderboard, then kick the least active member."""
+    async def _post_weekly_ranking_for_guild(
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        dry_run: bool = False,
+    ) -> bool:
         now = datetime.datetime.now(datetime.timezone.utc)
         week_start = (now - datetime.timedelta(days=7)).strftime("%b %d")
         week_end = now.strftime("%b %d, %Y")
 
-        for guild in self.bot.guilds:
+        try:
             try:
-                # Determine the target channel
-                channel = None
-                if target_channel_id:
-                    channel = guild.get_channel(target_channel_id)
-                else:
-                    channel = discord.utils.get(guild.text_channels, name=ACTIVITY_CHANNEL_NAME)
-
-                if not channel:
-                    logger.debug(f"Skipping {guild.name}: No #{ACTIVITY_CHANNEL_NAME} channel found")
-                    continue
-
-                try:
-                    await guild.chunk(cache=True)
-                except Exception as e:
-                    logger.warning(f"Could not refresh member cache for {guild.name}: {e}")
-
-                # Fetch message counts from DB
-                db_counts = await get_weekly_message_counts(str(guild.id))
-                current_member_ids = {str(member.id) for member in guild.members if not member.bot}
-                count_map = {
-                    entry["author_id"]: entry["count"]
-                    for entry in db_counts
-                    if entry["author_id"] in current_member_ids
-                }
-
-                # Build ranked list of all non-bot members
-                members = [m for m in guild.members if not m.bot]
-                ranked = sorted(
-                    members,
-                    key=lambda m: (count_map.get(str(m.id), 0), -(m.joined_at.timestamp() if m.joined_at else 0)),
-                    reverse=True,
-                )
-
-                top5 = ranked[:5]
-                bottom5 = list(reversed(ranked[-5:])) if len(ranked) >= 5 else list(reversed(ranked))
-
-                # Build embed
-                embed = discord.Embed(
-                    title=f"📊 Weekly Activity Report — {week_start}–{week_end}",
-                    color=discord.Color.blurple(),
-                )
-
-                top_lines = []
-                medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-                for i, member in enumerate(top5):
-                    msgs = count_map.get(str(member.id), 0)
-                    label = "msg" if msgs == 1 else "msgs"
-                    top_lines.append(f"{medals[i]} {member.mention} — **{msgs} {label}**")
-                embed.add_field(name="🏆 Most Active", value="\n".join(top_lines) or "No data", inline=False)
-
-                bottom_lines = []
-                for member in bottom5:
-                    msgs = count_map.get(str(member.id), 0)
-                    label = "msg" if msgs == 1 else "msgs"
-                    bottom_lines.append(f"• {member.mention} — **{msgs} {label}**")
-                embed.add_field(name="💤 Least Active", value="\n".join(bottom_lines) or "No data", inline=False)
-
-                await channel.send(embed=embed)
-
-                # Check server-wide baseline before running the purge
-                server_total = sum(count_map.values())
-                if server_total < WEEKLY_MIN_SERVER_MESSAGES:
-                    await channel.send(
-                        f"📭 Server only had **{server_total} messages** this week "
-                        f"(minimum {WEEKLY_MIN_SERVER_MESSAGES} required). No purge this week."
-                    )
-                    logger.info(f"Skipping purge for {guild.name}: server total {server_total} < {WEEKLY_MIN_SERVER_MESSAGES}")
-                    continue
-
-                # Find kick candidate: least active non-bot, non-owner, non-admin
-                kick_candidates = [
-                    m for m in reversed(ranked)
-                    if not m.bot
-                    and m != guild.owner
-                    and not m.guild_permissions.administrator
-                ]
-
-                if kick_candidates:
-                    victim = kick_candidates[0]
-                    victim_msgs = count_map.get(str(victim.id), 0)
-
-                    # Check member baseline — everyone pulled their weight
-                    if victim_msgs >= WEEKLY_MIN_MEMBER_MESSAGES:
-                        await channel.send(
-                            f"✅ Everyone met the activity baseline this week "
-                            f"(**{WEEKLY_MIN_MEMBER_MESSAGES}+ messages**). No purge. Keep it up!"
-                        )
-                        logger.info(f"Skipping purge for {guild.name}: least active member has {victim_msgs} msgs")
-                        continue
-
-                    label = "message" if victim_msgs == 1 else "messages"
-                    if dry_run:
-                        await channel.send(
-                            f"👀 {victim.mention} you only sent **{victim_msgs} {label}** this week. "
-                            f"You need to up your game — next time this is for real. 😤"
-                        )
-                        logger.info(f"[dry run] Would have kicked {victim} from {guild.name} ({victim_msgs} msgs)")
-                    else:
-                        await channel.send(
-                            f"⚠️ {victim.mention} you sent only **{victim_msgs} {label}** this week. "
-                            f"You are being **purged from the server in 1 hour**. "
-                            f"This is your only warning. 🕐"
-                        )
-                        logger.info(f"⏳ Purge warning sent to {victim} in {guild.name}. Kick in 1 hour.")
-                        await asyncio.sleep(3600)
-                        try:
-                            await guild.kick(victim, reason="Weekly inactivity purge")
-                            await channel.send(f"🦵 {victim.mention} has been purged. See you never.")
-                            logger.info(f"🦵 Kicked {victim} from {guild.name} for inactivity ({victim_msgs} msgs)")
-                        except discord.Forbidden:
-                            logger.warning(f"❌ Missing kick permission in {guild.name}")
-                        except Exception as e:
-                            logger.error(f"❌ Error kicking {victim} from {guild.name}: {e}")
-                else:
-                    logger.info(f"No eligible kick candidates in {guild.name}")
-
+                await asyncio.wait_for(guild.chunk(cache=True), timeout=15)
+            except asyncio.TimeoutError:
+                logger.warning(f"guild.chunk timed out for {guild.name}; proceeding with cached members")
             except Exception as e:
-                logger.error(f"Error in weekly ranking for {guild.name}: {e}")
+                logger.warning(f"Could not refresh member cache for {guild.name}: {e}")
+
+            current_member_ids = {str(member.id) for member in guild.members if not member.bot}
+
+            # Fetch message counts from DB
+            db_counts = await get_weekly_message_counts(str(guild.id))
+            count_map = {
+                entry["author_id"]: entry["count"]
+                for entry in db_counts
+                if entry["author_id"] in current_member_ids
+            }
+
+            # Build ranked list of all non-bot members
+            members = [m for m in guild.members if not m.bot]
+            ranked = sorted(
+                members,
+                key=lambda m: (count_map.get(str(m.id), 0), -(m.joined_at.timestamp() if m.joined_at else 0)),
+                reverse=True,
+            )
+
+            top5 = ranked[:5]
+            bottom5 = list(reversed(ranked[-5:])) if len(ranked) >= 5 else list(reversed(ranked))
+
+            # Build embed
+            embed = discord.Embed(
+                title=f"📊 Weekly Activity Report — {week_start}–{week_end}",
+                color=discord.Color.blurple(),
+            )
+
+            top_lines = []
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            for i, member in enumerate(top5):
+                msgs = count_map.get(str(member.id), 0)
+                label = "msg" if msgs == 1 else "msgs"
+                top_lines.append(f"{medals[i]} {member.mention} — **{msgs} {label}**")
+            embed.add_field(name="🏆 Most Active", value="\n".join(top_lines) or "No data", inline=False)
+
+            bottom_lines = []
+            for member in bottom5:
+                msgs = count_map.get(str(member.id), 0)
+                label = "msg" if msgs == 1 else "msgs"
+                bottom_lines.append(f"• {member.mention} — **{msgs} {label}**")
+            embed.add_field(name="💤 Least Active", value="\n".join(bottom_lines) or "No data", inline=False)
+
+            await channel.send(embed=embed)
+
+            # Check server-wide baseline before running the purge
+            server_total = sum(count_map.values())
+            if server_total < WEEKLY_MIN_SERVER_MESSAGES:
+                await channel.send(
+                    f"📭 Server only had **{server_total} messages** this week "
+                    f"(minimum {WEEKLY_MIN_SERVER_MESSAGES} required). No purge this week."
+                )
+                logger.info(f"Skipping purge for {guild.name}: server total {server_total} < {WEEKLY_MIN_SERVER_MESSAGES}")
+                return True
+
+            # Find kick candidate: least active non-bot, non-owner, non-admin
+            kick_candidates = [
+                m for m in reversed(ranked)
+                if not m.bot
+                and m != guild.owner
+                and not m.guild_permissions.administrator
+            ]
+
+            if kick_candidates:
+                victim = kick_candidates[0]
+                victim_msgs = count_map.get(str(victim.id), 0)
+
+                # Check member baseline — everyone pulled their weight
+                if victim_msgs >= WEEKLY_MIN_MEMBER_MESSAGES:
+                    await channel.send(
+                        f"✅ Everyone met the activity baseline this week "
+                        f"(**{WEEKLY_MIN_MEMBER_MESSAGES}+ messages**). No purge. Keep it up!"
+                    )
+                    logger.info(f"Skipping purge for {guild.name}: least active member has {victim_msgs} msgs")
+                    return True
+
+                label = "message" if victim_msgs == 1 else "messages"
+                if dry_run:
+                    await channel.send(
+                        f"👀 {victim.mention} you only sent **{victim_msgs} {label}** this week. "
+                        f"You need to up your game — next time this is for real. 😤"
+                    )
+                    logger.info(f"[dry run] Would have kicked {victim} from {guild.name} ({victim_msgs} msgs)")
+                else:
+                    await channel.send(
+                        f"⚠️ {victim.mention} you sent only **{victim_msgs} {label}** this week. "
+                        f"You are being **purged from the server in 1 hour**. "
+                        f"This is your only warning. 🕐"
+                    )
+                    logger.info(f"⏳ Purge warning sent to {victim} in {guild.name}. Kick in 1 hour.")
+                    await asyncio.sleep(3600)
+                    try:
+                        await guild.kick(victim, reason="Weekly inactivity purge")
+                        await channel.send(f"🦵 {victim.mention} has been purged. See you never.")
+                        logger.info(f"🦵 Kicked {victim} from {guild.name} for inactivity ({victim_msgs} msgs)")
+                    except discord.Forbidden:
+                        logger.warning(f"❌ Missing kick permission in {guild.name}")
+                    except Exception as e:
+                        logger.error(f"❌ Error kicking {victim} from {guild.name}: {e}")
+            else:
+                logger.info(f"No eligible kick candidates in {guild.name}")
+
+            return True
+        except Exception as e:
+            logger.error(f"Error in weekly ranking for {guild.name}: {e}")
+            return False
+
+    async def post_weekly_rankings(self, target_channel_id: int = None, dry_run: bool = False) -> int:
+        """Build and post the weekly activity leaderboard, then kick the least active member."""
+        posted = 0
+        for guild in self.bot.guilds:
+            # Determine the target channel
+            if target_channel_id:
+                channel = guild.get_channel(target_channel_id)
+            else:
+                channel = discord.utils.get(guild.text_channels, name=ACTIVITY_CHANNEL_NAME)
+
+            if not channel:
+                logger.debug(f"Skipping {guild.name}: No target channel found")
+                continue
+
+            if await self._post_weekly_ranking_for_guild(guild, channel, dry_run=dry_run):
+                posted += 1
+
+        return posted
 
 
     @tasks.loop(time=[datetime.time(hour=20, minute=45, tzinfo=datetime.timezone.utc)])
