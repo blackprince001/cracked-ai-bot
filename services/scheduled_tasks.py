@@ -327,5 +327,8 @@ _scheduled_tasks_instance: "ScheduledTasks | None" = None
 
 def setup_scheduled_tasks(bot):
     global _scheduled_tasks_instance
+    if _scheduled_tasks_instance is not None:
+        logger.info("Scheduled tasks already running — skipping re-initialization")
+        return _scheduled_tasks_instance
     _scheduled_tasks_instance = ScheduledTasks(bot)
     return _scheduled_tasks_instance
