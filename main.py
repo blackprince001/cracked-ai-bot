@@ -40,7 +40,8 @@ async def on_ready():
 
   # Initialize scheduled tasks
   from services.scheduled_tasks import setup_scheduled_tasks
-  setup_scheduled_tasks(bot)
+  scheduled_tasks = setup_scheduled_tasks(bot)
+  await scheduled_tasks.hydrate_missing_weekly_activity()
 
 
 @bot.event
@@ -103,6 +104,7 @@ async def on_message(message: discord.Message):
       content="[wordle]",
       content_hash=content_hash,
       message_url=message.jump_url,
+      created_at=message.created_at,
     )
 
   # Ignore bot messages
@@ -120,6 +122,7 @@ async def on_message(message: discord.Message):
       content=message.content[:500] if message.content else "[attachment]",
       content_hash=content_hash,
       message_url=message.jump_url,
+      created_at=message.created_at,
     )
 
   # Check if this is a reply to the bot's message

@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 
 import discord
 from discord.ext import tasks
@@ -15,8 +16,9 @@ from config import (
     WEEKLY_MIN_SERVER_MESSAGES,
     WEEKLY_RANKING_HOUR,
     WEEKLY_RANKING_MINUTE,
+    WORDLE_CHANNEL_NAME,
 )
-from db.message_db import get_weekly_message_counts
+from db.message_db import bulk_insert_messages, get_weekly_message_counts
 from services.leetcode_service import get_leetcode_service
 from services.neetcode_service import get_neetcode_service
 from utils.logging import get_logger
@@ -153,6 +155,107 @@ class ScheduledTasks:
     async def before_weekly_ranking_task(self):
         await self.bot.wait_until_ready()
 
+    async def hydrate_missing_weekly_activity(self):
+        """Rebuild this week's activity from Discord only when the DB has no rows for a guild."""
+        for guild in self.bot.guilds:
+            try:
+                await guild.chunk(cache=True)
+            except Exception as e:
+                logger.warning(f"Could not refresh member cache for {guild.name}: {e}")
+
+            try:
+                existing_counts = await get_weekly_message_counts(str(guild.id))
+                if existing_counts:
+                    logger.info(f"Skipping weekly restore for {guild.name}: DB already has current-week rows")
+                    continue
+
+                member_ids = {str(member.id) for member in guild.members if not member.bot}
+                if not member_ids:
+                    logger.info(f"Skipping weekly restore for {guild.name}: no non-bot members")
+                    continue
+
+                restored = await self._restore_guild_weekly_messages(guild, member_ids)
+                logger.info(f"Restored {restored} weekly activity rows for {guild.name}")
+            except Exception as e:
+                logger.error(f"Failed weekly restore for {guild.name}: {e}")
+
+    async def _restore_guild_weekly_messages(self, guild: discord.Guild, member_ids: set[str]) -> int:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        channels = list(guild.text_channels)
+        channels.extend(thread for thread in guild.threads if not thread.archived)
+
+        inserted = 0
+        for channel in channels:
+            if not channel.permissions_for(guild.me).read_message_history:
+                continue
+
+            pending_rows = []
+            try:
+                async for message in channel.history(limit=None, after=cutoff, oldest_first=True):
+                    row = self._build_activity_row(message, guild.id, member_ids)
+                    if row:
+                        pending_rows.append(row)
+            except discord.Forbidden:
+                logger.debug(f"Missing history permission for {guild.name} #{channel.name}")
+                continue
+            except Exception as e:
+                logger.warning(f"Error reading history for {guild.name} #{channel.name}: {e}")
+                continue
+
+            if pending_rows:
+                inserted += await bulk_insert_messages(pending_rows)
+
+        return inserted
+
+    def _build_activity_row(
+        self,
+        message: discord.Message,
+        guild_id: int,
+        member_ids: set[str],
+    ) -> dict | None:
+        if not message.guild:
+            return None
+
+        # Preserve Wordle credit, which is represented by the bot response carrying the user interaction.
+        if (
+            message.author.bot
+            and message.interaction
+            and hasattr(message.channel, "name")
+            and message.channel.name == WORDLE_CHANNEL_NAME
+        ):
+            author_id = str(message.interaction.user.id)
+            if author_id not in member_ids:
+                return None
+
+            return {
+                "message_id": str(message.interaction.id),
+                "channel_id": str(message.channel.id),
+                "guild_id": str(guild_id),
+                "author_id": author_id,
+                "content": "[wordle]",
+                "content_hash": hashlib.sha256(str(message.interaction.id).encode()).hexdigest(),
+                "message_url": message.jump_url,
+                "created_at": message.created_at,
+            }
+
+        if message.author.bot:
+            return None
+
+        author_id = str(message.author.id)
+        if author_id not in member_ids:
+            return None
+
+        return {
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "guild_id": str(guild_id),
+            "author_id": author_id,
+            "content": message.content[:500] if message.content else "[attachment]",
+            "content_hash": hashlib.sha256(str(message.id).encode()).hexdigest(),
+            "message_url": message.jump_url,
+            "created_at": message.created_at,
+        }
+
     async def post_weekly_rankings(self, target_channel_id: int = None, dry_run: bool = False):
         """Build and post the weekly activity leaderboard, then kick the least active member."""
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -172,9 +275,19 @@ class ScheduledTasks:
                     logger.debug(f"Skipping {guild.name}: No #{ACTIVITY_CHANNEL_NAME} channel found")
                     continue
 
+                try:
+                    await guild.chunk(cache=True)
+                except Exception as e:
+                    logger.warning(f"Could not refresh member cache for {guild.name}: {e}")
+
                 # Fetch message counts from DB
                 db_counts = await get_weekly_message_counts(str(guild.id))
-                count_map = {entry["author_id"]: entry["count"] for entry in db_counts}
+                current_member_ids = {str(member.id) for member in guild.members if not member.bot}
+                count_map = {
+                    entry["author_id"]: entry["count"]
+                    for entry in db_counts
+                    if entry["author_id"] in current_member_ids
+                }
 
                 # Build ranked list of all non-bot members
                 members = [m for m in guild.members if not m.bot]
